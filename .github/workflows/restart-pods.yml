@@ -1,0 +1,139 @@
+name: Restart Pods
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'What to restart'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - api
+          - auth-service
+          - email-service
+          - interview-service
+          - avatar-service
+          - psychometric-service
+          - nextjs
+          - grafana-agent
+
+env:
+  INFRA_OWNER: your-org
+  INFRA_REPO: infra-rds
+
+jobs:
+  trigger-and-monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Trigger Restart Workflow
+        id: trigger
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.INFRA_PAT }}
+          script: |
+            const owner = '${{ env.INFRA_OWNER }}';
+            const repo = '${{ env.INFRA_REPO }}';
+            const workflow_id = 'eks-restart-pods.yml';
+            const triggerTime = new Date();
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo, workflow_id,
+              ref: 'main',
+              inputs: { target: '${{ inputs.target }}' }
+            });
+
+            console.log(`Triggered restart for: ${{ inputs.target }}`);
+            await new Promise(resolve => setTimeout(resolve, 5000));
+
+            let runId = null;
+            for (let i = 0; i < 10; i++) {
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id, per_page: 5
+              });
+              const newRun = runs.data.workflow_runs.find(run =>
+                new Date(run.created_at) >= triggerTime
+              );
+              if (newRun) {
+                runId = newRun.id;
+                break;
+              }
+              await new Promise(resolve => setTimeout(resolve, 3000));
+            }
+
+            if (!runId) throw new Error('Could not find triggered workflow run');
+            core.setOutput('run_id', runId);
+            core.setOutput('run_url', `https://github.com/${owner}/${repo}/actions/runs/${runId}`);
+
+      - name: Wait for Restart Completion
+        id: wait
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.INFRA_PAT }}
+          script: |
+            const owner = '${{ env.INFRA_OWNER }}';
+            const repo = '${{ env.INFRA_REPO }}';
+            const runId = ${{ steps.trigger.outputs.run_id }};
+
+            console.log(`Monitoring: ${{ steps.trigger.outputs.run_url }}`);
+
+            let status = 'queued';
+            let conclusion = null;
+
+            while (['queued', 'in_progress', 'waiting'].includes(status)) {
+              await new Promise(resolve => setTimeout(resolve, 10000));
+              const run = await github.rest.actions.getWorkflowRun({
+                owner, repo, run_id: runId
+              });
+              status = run.data.status;
+              conclusion = run.data.conclusion;
+              console.log(`Status: ${status}${conclusion ? ` (${conclusion})` : ''}`);
+            }
+
+            core.setOutput('conclusion', conclusion);
+
+      - name: Fetch Pod Status from Logs
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.INFRA_PAT }}
+          script: |
+            const owner = '${{ env.INFRA_OWNER }}';
+            const repo = '${{ env.INFRA_REPO }}';
+            const runId = ${{ steps.trigger.outputs.run_id }};
+
+            const jobs = await github.rest.actions.listJobsForWorkflowRun({
+              owner, repo, run_id: runId
+            });
+
+            console.log('\n======== RESTART PODS SUMMARY ========\n');
+            console.log(`Target: ${{ inputs.target }}`);
+
+            for (const job of jobs.data.jobs) {
+              const icon = job.conclusion === 'success' ? '✅' : '❌';
+              console.log(`${icon} ${job.name}: ${job.conclusion || job.status}`);
+
+              // Try to get last step output (pod status)
+              if (job.steps) {
+                const verifyStep = job.steps.find(s => s.name.includes('Verify'));
+                if (verifyStep) {
+                  console.log(`   Verification: ${verifyStep.conclusion}`);
+                }
+              }
+            }
+
+            console.log(`\nFull logs: ${{ steps.trigger.outputs.run_url }}`);
+
+      - name: Report Result
+        if: always()
+        run: |
+          echo "## Restart Pods Result" >> $GITHUB_STEP_SUMMARY
+          echo "| Target | ${{ inputs.target }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ steps.wait.outputs.conclusion }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Logs | [View](${{ steps.trigger.outputs.run_url }}) |" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.wait.outputs.conclusion }}" != "success" ]; then
+            exit 1
+          fi
