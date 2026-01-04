@@ -1,0 +1,176 @@
+name: Start EKS Cluster
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        required: true
+        default: 'prod'
+        type: choice
+        options:
+          - prod
+          - dev2
+
+env:
+  INFRA_OWNER: your-org        # Replace with your GitHub org/user
+  INFRA_REPO: infra-rds        # Replace with your infra repo name
+
+jobs:
+  trigger-and-monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Trigger Start Workflow
+        id: trigger
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.INFRA_PAT }}
+          script: |
+            const owner = '${{ env.INFRA_OWNER }}';
+            const repo = '${{ env.INFRA_REPO }}';
+            const workflow_id = 'eks-rds-${{ inputs.environment }}-scheduler.yml';
+
+            // Get current time to find the new run
+            const triggerTime = new Date();
+
+            // Trigger the workflow
+            await github.rest.actions.createWorkflowDispatch({
+              owner,
+              repo,
+              workflow_id,
+              ref: 'main',
+              inputs: { action: 'start' }
+            });
+
+            console.log(`Triggered ${workflow_id} at ${triggerTime.toISOString()}`);
+
+            // Wait a bit for the run to be created
+            await new Promise(resolve => setTimeout(resolve, 5000));
+
+            // Find the triggered run
+            let runId = null;
+            for (let i = 0; i < 10; i++) {
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner,
+                repo,
+                workflow_id,
+                per_page: 5
+              });
+
+              const newRun = runs.data.workflow_runs.find(run => {
+                const runTime = new Date(run.created_at);
+                return runTime >= triggerTime;
+              });
+
+              if (newRun) {
+                runId = newRun.id;
+                console.log(`Found workflow run: ${runId}`);
+                break;
+              }
+              await new Promise(resolve => setTimeout(resolve, 3000));
+            }
+
+            if (!runId) {
+              throw new Error('Could not find triggered workflow run');
+            }
+
+            core.setOutput('run_id', runId);
+            core.setOutput('run_url', `https://github.com/${owner}/${repo}/actions/runs/${runId}`);
+
+      - name: Wait for Workflow Completion
+        id: wait
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.INFRA_PAT }}
+          script: |
+            const owner = '${{ env.INFRA_OWNER }}';
+            const repo = '${{ env.INFRA_REPO }}';
+            const runId = ${{ steps.trigger.outputs.run_id }};
+
+            console.log(`Monitoring workflow run: ${runId}`);
+            console.log(`View live: ${{ steps.trigger.outputs.run_url }}`);
+
+            let status = 'queued';
+            let conclusion = null;
+            let lastStatus = '';
+
+            while (status === 'queued' || status === 'in_progress' || status === 'waiting') {
+              await new Promise(resolve => setTimeout(resolve, 30000)); // Check every 30s
+
+              const run = await github.rest.actions.getWorkflowRun({
+                owner,
+                repo,
+                run_id: runId
+              });
+
+              status = run.data.status;
+              conclusion = run.data.conclusion;
+
+              if (status !== lastStatus) {
+                console.log(`Status: ${status}${conclusion ? ` (${conclusion})` : ''}`);
+                lastStatus = status;
+              }
+            }
+
+            core.setOutput('conclusion', conclusion);
+            core.setOutput('status', status);
+
+      - name: Fetch Workflow Logs
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.INFRA_PAT }}
+          script: |
+            const owner = '${{ env.INFRA_OWNER }}';
+            const repo = '${{ env.INFRA_REPO }}';
+            const runId = ${{ steps.trigger.outputs.run_id }};
+
+            // Get jobs for this run
+            const jobs = await github.rest.actions.listJobsForWorkflowRun({
+              owner,
+              repo,
+              run_id: runId
+            });
+
+            console.log('\n========================================');
+            console.log('WORKFLOW EXECUTION SUMMARY');
+            console.log('========================================\n');
+
+            for (const job of jobs.data.jobs) {
+              const icon = job.conclusion === 'success' ? '✅' :
+                          job.conclusion === 'failure' ? '❌' :
+                          job.conclusion === 'skipped' ? '⏭️' : '⏳';
+              console.log(`${icon} ${job.name}: ${job.conclusion || job.status}`);
+
+              // Show step details for failed jobs
+              if (job.conclusion === 'failure') {
+                console.log('   Failed steps:');
+                for (const step of job.steps || []) {
+                  if (step.conclusion === 'failure') {
+                    console.log(`   ❌ ${step.name}`);
+                  }
+                }
+              }
+            }
+
+            console.log('\n========================================');
+            console.log(`Full logs: ${{ steps.trigger.outputs.run_url }}`);
+            console.log('========================================\n');
+
+      - name: Report Result
+        if: always()
+        run: |
+          echo "## Start Cluster Result" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ steps.wait.outputs.conclusion }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Workflow Run | [View Logs](${{ steps.trigger.outputs.run_url }}) |" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.wait.outputs.conclusion }}" != "success" ]; then
+            echo ""
+            echo "::error::Workflow failed with conclusion: ${{ steps.wait.outputs.conclusion }}"
+            exit 1
+          fi
