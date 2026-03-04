@@ -1,0 +1,116 @@
+name: Prod EKS Control
+
+# Dispatches start/stop/status to sainterview-infra prod scheduler.
+# Requires secret: INFRA_PAT (fine-grained PAT with actions:write on saintdevops-creator/sainterview-infra)
+#
+# WARNING: This controls the PRODUCTION cluster (sainterview-prod-eks).
+# The prod scheduler in sainterview-infra also runs on a cron schedule:
+#   Start: 22:00 UTC (05:30 IST)
+#   Stop : 18:30 UTC (00:00 IST)
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform on PROD EKS cluster'
+        required: true
+        default: 'status'
+        type: choice
+        options:
+          - start
+          - stop
+          - status
+
+jobs:
+  dispatch-to-infra:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch action to sainterview-infra
+        id: dispatch
+        env:
+          GH_TOKEN: ${{ secrets.INFRA_PAT }}
+        run: |
+          echo "================================================"
+          echo "PROD EKS Control"
+          echo "Action  : ${{ inputs.action }}"
+          echo "Target  : saintdevops-creator/sainterview-infra"
+          echo "Workflow: eks-rds-prod-scheduler.yml"
+          echo "================================================"
+
+          BEFORE_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          gh workflow run eks-rds-prod-scheduler.yml \
+            --repo saintdevops-creator/sainterview-infra \
+            --ref develop \
+            --field action=${{ inputs.action }}
+
+          echo "Dispatch sent at $BEFORE_TIME. Waiting for run to appear..."
+          echo "before_time=$BEFORE_TIME" >> "$GITHUB_OUTPUT"
+
+      - name: Find triggered run
+        id: find-run
+        env:
+          GH_TOKEN: ${{ secrets.INFRA_PAT }}
+        run: |
+          BEFORE="${{ steps.dispatch.outputs.before_time }}"
+          RUN_ID=""
+
+          for i in $(seq 1 12); do
+            sleep 5
+            RUN_ID=$(gh run list \
+              --repo saintdevops-creator/sainterview-infra \
+              --workflow eks-rds-prod-scheduler.yml \
+              --limit 5 \
+              --json databaseId,createdAt,event \
+              --jq --arg before "$BEFORE" \
+              '.[] | select(.event == "workflow_dispatch" and .createdAt >= $before) | .databaseId' \
+              | head -1)
+
+            if [ -n "$RUN_ID" ]; then
+              RUN_URL="https://github.com/saintdevops-creator/sainterview-infra/actions/runs/$RUN_ID"
+              echo "Found run ID : $RUN_ID"
+              echo "Run URL      : $RUN_URL"
+              echo "run_id=$RUN_ID"   >> "$GITHUB_OUTPUT"
+              echo "run_url=$RUN_URL" >> "$GITHUB_OUTPUT"
+              break
+            fi
+            echo "Attempt $i/12: run not yet visible, retrying..."
+          done
+
+          if [ -z "$RUN_ID" ]; then
+            echo "ERROR: Could not find the triggered run after 60s."
+            exit 1
+          fi
+
+      - name: Monitor run until completion
+        env:
+          GH_TOKEN: ${{ secrets.INFRA_PAT }}
+          RUN_ID: ${{ steps.find-run.outputs.run_id }}
+          RUN_URL: ${{ steps.find-run.outputs.run_url }}
+        run: |
+          echo "Monitoring: $RUN_URL"
+          echo ""
+
+          while true; do
+            RUN_DATA=$(gh run view "$RUN_ID" \
+              --repo saintdevops-creator/sainterview-infra \
+              --json status,conclusion,updatedAt)
+
+            STATUS=$(echo "$RUN_DATA"     | jq -r '.status')
+            CONCLUSION=$(echo "$RUN_DATA" | jq -r '.conclusion')
+            UPDATED=$(echo "$RUN_DATA"    | jq -r '.updatedAt')
+
+            echo "[$(date -u +%H:%M:%S UTC)] status=$STATUS  updated=$UPDATED"
+
+            if [ "$STATUS" = "completed" ]; then
+              echo ""
+              echo "================================================"
+              echo "Result    : $CONCLUSION"
+              echo "Full logs : $RUN_URL"
+              echo "================================================"
+              [ "$CONCLUSION" = "success" ] || exit 1
+              break
+            fi
+
+            sleep 30
+          done
